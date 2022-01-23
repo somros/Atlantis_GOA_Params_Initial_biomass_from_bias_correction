@@ -1,0 +1,300 @@
+---
+title: "Adjusting biomass estimates for Atlantis GOA"
+author: "Alberto Rovellini"
+date: "1/19/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+We have collected estimates of 1990 biomass from AK NOAA stock assessments. However, those biomass estimates have two problems:
+
+1. They do not capture all age classes. Different stock assessments model different minimum ages, but in general always from a certain year up (from 1+ for many to 8+ for some extreme cases). We need to do a rough estimate of how much biomass of young fish we are not capturing and correct the estimates by that biomass. The simplest thing to do is to use exp(-M) to back-calculate the biomass of the smaller age classes. Technically, if we are interested in 1990 biomass of a species that is assessed as age 3+, we should use 1991 3+ estimates for age 2, 1992 3+ estimates for age 1, 1993 3+ estimates for age 0 in 1990. 
+
+2. They do not capture BC biomass. For the species we have BC stock assessments for, we need to sum up biomasses (ask Sean Anderson for data). As a first-order approximation we should use the values of S1-S4 to map estimates obtained at point 1.
+
+```{r}
+library(tidyverse)
+library(viridis)
+library(data.table)
+```
+
+
+# Estimate biomass of age classes outside the assessment
+
+Based on M, VBGF, LWR, and biomass estimates, we can do a coarse breakdown of the total numbers into numbers by age. Then we can use the biomass of the first assessed age class to back-calculate. Few problems with this:
+
+1. This ignores age-specific M. If we could at least get estimates of M for the first age class it would help.
+2. Using the same M for all years assumes that every year age classes are found in the same proportion. This ignores process variance in recruitment. Using time series of age composition from stock assessments may alleviate this problem.
+3. This also ignores fishing mortality, and decomposing a total numbers based on only M is going to underpredict the numbers of the smallest size class assessed (you are basically assigning too much biomass to the older age classes, which also get fished out).
+
+## Read data
+
+This is data from stock assessments, either communicated directly by the authors in case where a reanalysis for age 1+ has happened or taken from the SAFE report. In some cases, some parameters come from different sources (e.g. RAM-Legacy data). For parameter sources, see https://docs.google.com/spreadsheets/d/1tPGd27JwRQlexf1At9BbzHrC6--uoMm7/edit#gid=1827076634.
+```{r}
+biom <- read.csv('C:/Users/Alberto Rovellini/Documents/GOA/StockAssessments/biomass_ts.csv')
+params <- read.csv('C:/Users/Alberto Rovellini/Documents/GOA/StockAssessments/parameters.csv')
+
+params <- params %>% mutate(Species = str_replace_all(Species, ' ','.'))
+```
+
+Steps, for each species:
+
+1. From M, get the proportion (of 1) of individuals.
+2. Get length at age with $L=Linf*(1-exp(-K*t))$
+3. Get weight at with $W=a*L^b$
+4. Multiply weight at age (only of the assessed age classes, e.g. 2+ or whatever) by each proportion and sum.
+5. Divide total biomass estimate by point 4 to have an estimated number of individuals.
+6. Multiply those by the corresponding proportions at age.
+7. Now you have individuals at the smallest age assessed. Roll it back with mortality to get numbers of unassessed age classes.
+8. Multiply by weight at age and you have biomass for the smaller age classes.
+9. Add that to the biomass estimates.
+
+NOTE: we are not using t0 in the VBGF formulation, however we need an age for age 0. This is the recruitment period parameter, or the larval duration. Those are all over the place right now unfortunately - for now simplify them all to 90 days but then fix this.
+```{r}
+params <- params %>% mutate(recage = 180) # need to drop this and have appropriate age of recruits
+```
+
+```{r}
+# pull species that are not 0+ (those are fine as they are) or not NA - the NAs are from RE models and they are typically referred to as "exploitable biomass"
+
+all_species <- params %>% filter(Minage>0, !is.na(Minage)) %>% pull(Species)
+
+get_unassessed_biomass <- function(this_species){
+  this_biom <- biom %>% select(Year, this_species) %>% drop_na()
+  
+  #biomass estimate
+  TB <- this_biom[,2]
+  
+  #parameters
+  M <- params %>% filter(Species==this_species) %>% pull(M)
+  minage <- params %>% filter(Species==this_species) %>% pull(Minage)
+  maxage <- params %>% filter(Species==this_species) %>% pull(Maxage)
+  recage <- params %>% filter(Species==this_species) %>% mutate(recage=recage/365) %>% pull(recage)
+  k <- params %>% filter(Species==this_species) %>% pull(k)
+  Linf <- params %>% filter(Species==this_species) %>% pull(Linf)
+  a <- params %>% filter(Species==this_species) %>% pull(a)
+  b <- params %>% filter(Species==this_species) %>% pull(b)
+  
+  #0. Make a dataframe to fill with properties by age class
+  dat <- data.frame('age'=0:maxage)
+  
+  #1. calculate proportion
+  dat <- dat %>% mutate(propexp = exp(-(age+1)*M),
+                        prop = propexp/sum(propexp)) %>% select(-propexp)
+  #2.VBGF for length at age
+  dat <- dat %>% rowwise %>% mutate(length = ifelse(age==0,
+                                                    Linf*(1-exp(-k*recage)),
+                                                    Linf*(1-exp(-k*age)))) %>% ungroup()
+  #3. weight at age
+  dat <- dat %>% mutate(weight = a*length^b)
+  
+  #4. weight at age by proportion of individuals
+  dat <- dat %>% mutate(propweight = prop*weight)
+  
+  #5. divide TB by the minage+ propweight - remember that TB is in mt and we need to go to g
+  Ntot <- TB*1000000/(dat %>% filter(age>=minage) %>% pull(propweight) %>% sum())
+  
+  #6. get numbers at smallest assessed age
+  nyear <- nrow(this_biom)
+  num_minage <- Ntot*(dat %>% filter(age==minage) %>% pull(prop))
+  young_nums <- data.frame(matrix(0, nrow = nyear, ncol = minage))
+  
+  #7. start working at year level here - get numbers of smaller age classes based on M and numbers at minage
+  for(i in 1:nyear){
+    for(j in 1:minage){
+      young_nums[i,j] <- num_minage[i+minage-(j-1)]*exp(M*minage-(j-1))
+    }
+  }
+  
+  #8. multiply by weight at age
+  colnames(young_nums) <- 0:(minage-1)
+  young_biomass <- young_nums %>% 
+    mutate(year=this_biom$Year) %>% 
+    pivot_longer(cols = -year, names_to = 'age', values_to = 'nums') %>%
+    mutate(age = as.integer(age)) %>%
+    left_join((dat %>% select(age,weight)), by = 'age') %>%
+    mutate(biom=nums*weight/1000000) %>% #go back to mt
+    group_by(year) %>%
+    summarise(unassessed_biom=sum(biom))
+  
+  #9. sum to original biomass
+  this_biom_all <- data.frame('Year' = this_biom$Year,
+                              'Species' = this_species,
+                              'Biomass_SA' = this_biom[,2],
+                              'Biomass_0plus' = rowSums(cbind(TB,young_biomass)))
+  
+}
+
+biom_all <- rbindlist(lapply(all_species, get_unassessed_biomass))
+```
+
+This method attempts to track recruitment variance in the unassessed age classes, making a lot of assumptions regarding the mortality in the first years of life, which is most likely a lot higher than the estimate we sue. The method could be improved by using estimates of mortality at younger age. View.
+
+```{r}
+biom_all %>%
+  pivot_longer(cols = c(Biomass_SA,Biomass_0plus), names_to = 'Biomass_type', values_to = 'Biom_mt') %>%
+  ggplot()+
+  geom_line(aes(x=Year,y=Biom_mt,color=Biomass_type))+
+  theme_bw()+
+  facet_wrap(~Species, scales = 'free')
+  
+```
+
+## Canada
+
+Here we use the values of S1-S4 for each species to redistribute species biomass to the boxes in Canadian waters. We then integrate over these boxes, and add the resulting biomass to the biomass estimates for each species. The use of one value for spatial distributions over time implies that the proportion of AK vs CA biomass is constant, which is an oversimplification. 
+
+Read S1-S4 data. These will be for the functional groups and not the individual stocks. Most of these come from the RACE+DFO data, but halibut does not (it comes from FISS data modelled with sdmTMB).
+```{r}
+s <- read.csv('C:/Users/Alberto Rovellini/Documents/GOA/SDM/Bias_correction/S1-S4_stages_verts.csv')
+
+all_groups <- read.csv('GOA_Groups.csv')
+all_groups <- all_groups %>% pull(Name) %>% sort()
+```
+
+Map species names to Atlantis groups. We will need to add up the biomasses for the species that compose a functional group.
+```{r}
+these_groups <- c('Flatfish_shallow', 'Arrowtooth_flounder', 'Flatfish_shallow', 'Flatfish_deep', 'Rockfish_pelagic_shelf', 'Flatfish_shallow', 'Flathead_sole', 'Flatfish_shallow', 'Pollock', 'Rex_sole', 'Flatfish_shallow', 'Flatfish_shallow', 'Flatfish_shallow', 'Rockfish_slope', 'Pacific_ocean_perch', 'Sablefish', 'Halibut')
+
+key <- data.frame('Species'=all_species,'Group'=these_groups)
+
+biom_groups <- biom_all %>%
+  left_join(key, by = 'Species') %>%
+  group_by(Year,Group) %>%
+  summarise(Biomass_0plus=sum(Biomass_0plus))
+```
+
+```{r}
+these_groups <- unique(these_groups)
+
+propframe <- data.frame(matrix(0, nrow = length(these_groups), ncol = 3)) %>% set_names(c('Group','AK','BC'))
+
+for(i in 1:length(these_groups)){
+  this_group <- these_groups[i]
+  # set this up to use summer (S3) distributions - just in case (they should all be at this stage)
+  # base this on adult distributions for now
+  
+  if(this_group=='Halibut'){
+    
+    sh <- read.csv('C:/Users/Alberto Rovellini/Documents/GOA/SDM/Halibut/code/s1s4.csv')
+    
+    this_s <- sh %>% 
+      set_names(c('box_id','S')) %>%
+      rowwise() %>%
+      mutate(area = ifelse(box_id<92,'AK','BC')) %>%
+      ungroup() %>%
+      group_by(area)%>%
+      summarise(prop = sum(S))
+  } else {
+    this_s <- s %>% 
+      mutate(box_id=0:(nrow(s)-1)) %>% 
+      select(box_id, paste(this_group,'A','S3',sep='_')) %>%
+      set_names(c('box_id','S')) %>%
+      rowwise() %>%
+      mutate(area = ifelse(box_id<92,'AK','BC')) %>%
+      ungroup() %>%
+      group_by(area)%>%
+      summarise(prop = sum(S)) 
+  }
+  propframe[i,] <- data.frame(this_group, this_s[this_s$area=='AK',]$prop, this_s[this_s$area=='BC',]$prop)
+}
+```
+
+Apply the correction and obtain estimates of biomass across the model domain.
+```{r}
+biom_groups <- biom_groups %>% 
+  left_join(propframe, by = 'Group') %>%
+  mutate(Biomass_BC = Biomass_0plus*BC/AK,
+         Biomass_total = Biomass_0plus+Biomass_BC)
+```
+
+View.
+```{r}
+biom_groups %>%
+  select(Year,Group,Biomass_0plus,Biomass_total) %>%
+  pivot_longer(cols = c(Biomass_0plus,Biomass_total), names_to = 'Biomass_type', values_to = 'Biomass_mt') %>%
+  ggplot()+
+  geom_line(aes(x=Year,y=Biomass_mt,color=Biomass_type))+
+  theme_bw()+
+  facet_wrap(~Group, scales='free')
+```
+
+This highlights the issues that come from the stitching of US and BC models. For example, Pacific halibut looks bad. Note to self to re-do it with FISS data to circumvent the issue of stitching different data. Slope rockfish (Northern mostly) is also dubious - in that case the issue seems to happen at the stage of the bias correction: at the interface between the two surveys, the AK surveys seemed to catch a lot more slope rockfish than the BC, so we adjusted the rockfish biomass. It should be noted that this is probably not a good idea for the slope species (like "slope" rockfish!), because the AK data includes slope data whereas the BC data is more at the Norther mouth of the Hecate Strait, which is on the shelf. We should probably consider not applying the correction to slope species.
+
+# Validation
+
+How does this look compared to estimates that we have from BC from the RAM-Legacy data?
+```{r}
+load("../BC_from_RAM_Legacy/RAMLDB v4.491/DB Files With Assessment Data/R Data/DBdata[asmt][v4.491].RData")
+
+# load these datasets from the RAM db
+ram_datasets <- c('timeseries_values_views', 'stock', 'area', 'bioparams','biometrics', 'timeseries_assessments_views',
+                  'bioparams_values_views', 'assessor', 'management', 'assessment')
+
+stock %>% select(region) %>% distinct() %>% pull()
+
+# What are the DFO areas in BC that overlap with the Atlantis domain?
+BC_regions <- c('Canada West Coast','Canada West Coast (Pacific Salmon)')
+
+bc_stock <- stock %>%
+  filter(region%in%BC_regions) 
+
+bc_assessment <- assessment %>% filter(stockid %in% (bc_stock %>% pull(stockid) %>% unique())) %>% select(assessid,stockid,stocklong,assessyear)
+
+bc_stocks <- bc_stock %>% pull(stockid) %>% unique() %>% sort()
+
+# ts for BC stocks
+bcts <- timeseries %>% 
+  filter(stockid %in% bc_stocks, tsid=='TB-MT') %>%
+  drop_na() %>%
+  left_join((bc_stock %>% select(stockid,commonname,scientificname,areaid)),by='stockid') %>%
+  select(tsyear,stockid,commonname,areaid,stocklong,tsvalue) %>%
+  arrange(commonname) 
+
+# drop everything by Vancouver Island - outside the model domain
+bcts <- bcts[-grepl('WCVANI', bcts$areaid),]
+
+# change species names to atlantis groups
+bc_species <- unique(bcts$commonname)
+bc_groups <- c(NA, NA, 'Flatfish_shallow', NA, NA, 'Cod', NA, 'Pacific_ocean_perch', 'Flatfish_shallow', 'Sablefish', NA)
+key_bc <- data.frame('commonname'=bc_species,'Group'=bc_groups)
+
+# aggregate by group and areas
+bcts <- bcts %>% 
+  left_join(key_bc, by = 'commonname') %>%
+  drop_na()%>%
+  group_by(tsyear,Group) %>%
+  summarise(biomtot = sum(tsvalue)) %>%
+  ungroup() %>%
+  set_names('Year','Group','Biomass_BC_SA')
+
+# join to our frame
+biom_groups %>%
+  select(Year, Group, Biomass_BC) %>%
+  left_join(bcts, by = c('Year','Group')) %>%
+  drop_na() %>%
+  pivot_longer(cols = c(Biomass_BC, Biomass_BC_SA), names_to = 'Biomass_type', values_to = 'Biomass_mt')%>%
+  ggplot()+
+  geom_line(aes(x=Year,y=Biomass_mt,color=Biomass_type))+
+  theme_bw()+
+  facet_wrap(~Group, scales='free')
+
+```
+
+We are able to compare only three stocks, and they are all terrible with the expansion via SDM. There is no reason to expect it to work, because it is based on the already shaky bias correction, and on top of that it expects the trends to be the same between AK and BC, because it estimates the biomass in BC based on the biomass in AK by expanding the latter based on constant proportions over time. The silver lining is that for shallow flatfish it hardly matters, since according to the SDM analysis 99% of the biomass is in the GOA and the estimated stock biomass is relatively low in BC anyway. 
+
+## 1990 biomass
+
+Write out a table with the biomass values for 1990 to use in the parameter file (when we fix the M issue above).
+```{r}
+biom_groups %>%
+  filter(Year==1990) %>%
+  select(Year,Group,Biomass_total) %>%
+  write.csv('total_biomass_1990.csv', row.names = FALSE)
+```
+
