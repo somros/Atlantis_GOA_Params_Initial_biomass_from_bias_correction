@@ -62,6 +62,9 @@ params <- params %>% mutate(recage = 180) # need to drop this and have appropria
 ```{r}
 # pull species that are not 0+ (those are fine as they are) or not NA - the NAs are from RE models and they are typically referred to as "exploitable biomass"
 
+# add condition that if agerec>365 we do not count that age class in summing up the total biomass, as it was a larva/embryo. This only seems to be the case for the RE model species (dogfish, skates, thornyhead, etc.). Leave that for now but be aware
+
+
 all_species <- params %>% filter(Minage>0, !is.na(Minage)) %>% pull(Species)
 
 get_unassessed_biomass <- function(this_species){
@@ -147,6 +150,8 @@ biom_all %>%
 
 ## Canada
 
+Purpose is to upscale estimates of initial (1990) biomass (inflated to account for unassessed age classes) from AK only to AK+BC, because they will be needed for the initial conditions.
+
 Here we use the values of S1-S4 for each species to redistribute species biomass to the boxes in Canadian waters. We then integrate over these boxes, and add the resulting biomass to the biomass estimates for each species. The use of one value for spatial distributions over time implies that the proportion of AK vs CA biomass is constant, which is an oversimplification. 
 
 Read S1-S4 data. These will be for the functional groups and not the individual stocks. Most of these come from the RACE+DFO data, but halibut does not (it comes from FISS data modelled with sdmTMB).
@@ -209,8 +214,12 @@ Apply the correction and obtain estimates of biomass across the model domain.
 ```{r}
 biom_groups <- biom_groups %>% 
   left_join(propframe, by = 'Group') %>%
-  mutate(Biomass_BC = Biomass_0plus*BC/AK,
+  mutate(BCtoAK = BC/AK,
+         Biomass_BC = Biomass_0plus*BCtoAK,
          Biomass_total = Biomass_0plus+Biomass_BC)
+
+# see for BC corrections in 1977 for recruitment calculations
+biom_groups %>% filter(Year==1990)
 ```
 
 View.
@@ -224,11 +233,13 @@ biom_groups %>%
   facet_wrap(~Group, scales='free')
 ```
 
-This highlights the issues that come from the stitching of US and BC models. For example, Pacific halibut looks bad. Note to self to re-do it with FISS data to circumvent the issue of stitching different data. Slope rockfish (Northern mostly) is also dubious - in that case the issue seems to happen at the stage of the bias correction: at the interface between the two surveys, the AK surveys seemed to catch a lot more slope rockfish than the BC, so we adjusted the rockfish biomass. It should be noted that this is probably not a good idea for the slope species (like "slope" rockfish!), because the AK data includes slope data whereas the BC data is more at the Norther mouth of the Hecate Strait, which is on the shelf. We should probably consider not applying the correction to slope species.
+This highlights the issues that come from the stitching of US and BC models. For example, Pacific halibut looks bad. Note to self to re-do it with FISS data to circumvent the issue of stitching different data. Slope rockfish (Northern mostly) is also dubious - in that case the issue seems to happen at the stage of the bias correction: at the interface between the two surveys, the AK surveys seemed to catch a lot more slope rockfish than the BC, so we adjusted the rockfish biomass. It should be noted that this is probably not a good idea for the slope species (like "slope" rockfish!), because the AK data includes slope data whereas the BC data is more at the Norther mouth of the Hecate Strait, which is on the shelf. We should probably consider not applying the correction to slope species - but it becomes pretty arbitrary then.
 
 # Validation
 
 How does this look compared to estimates that we have from BC from the RAM-Legacy data?
+
+Extract data for BC, by species first. 
 ```{r}
 load("../BC_from_RAM_Legacy/RAMLDB v4.491/DB Files With Assessment Data/R Data/DBdata[asmt][v4.491].RData")
 
@@ -257,8 +268,11 @@ bcts <- timeseries %>%
   arrange(commonname) 
 
 # drop everything by Vancouver Island - outside the model domain
-bcts <- bcts[-grepl('WCVANI', bcts$areaid),]
+bcts <- bcts[!grepl('WCVANI', bcts$areaid),]
+```
 
+Organize in Atlantis groups.
+```{r}
 # change species names to atlantis groups
 bc_species <- unique(bcts$commonname)
 bc_groups <- c(NA, NA, 'Flatfish_shallow', NA, NA, 'Cod', NA, 'Pacific_ocean_perch', 'Flatfish_shallow', 'Sablefish', NA)
